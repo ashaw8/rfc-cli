@@ -1,0 +1,616 @@
+#!/usr/bin/python3 -I
+"""rfc - read IETF RFCs and Internet-Drafts from the terminal.
+
+  rfc 9000                 read RFC 9000 in your pager
+  rfc 9000 -s "Section 17" read RFC 9000, jumping to the first match
+  rfc info 9000            metadata: status, obsoletes/updated-by, abstract
+  rfc search quic loss     search titles/keywords/abstracts (all terms must match)
+  rfc draft draft-ietf-quic-multipath     read the latest revision of a draft
+  rfc draft draft-ietf-quic-multipath-17  read a specific revision
+  rfc wg quic              list a working group's active drafts and its RFCs
+  rfc ls                   list everything cached locally
+  rfc sync                 refresh the RFC index now
+
+IETF meeting agenda (defaults to the current/most recent meeting; add a number, e.g. 126, for another):
+  rfc ietf                 full schedule (▶ = in progress, ★ = starred, past sessions dimmed)
+  rfc ietf today|tomorrow|now|wed
+  rfc ietf quic            a WG's sessions, rooms, posted agenda, slides, and drafts on the agenda
+  rfc ietf sec             all sessions in an area
+  rfc ietf star quic tls   remember WGs you're following; `rfc ietf mine` lists just those
+
+Documents are cached in ~/.cache/rfc, so anything you've opened once is
+readable offline (handy on conference wifi). Pre-fetch with `rfc get 9000 9001`.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "rfc")
+INDEX_URL = "https://www.rfc-editor.org/rfc-index.xml"
+INDEX_PATH = os.path.join(CACHE, "rfc-index.xml")
+INDEX_MAX_AGE = 7 * 86400
+NS = "{https://www.rfc-editor.org/rfc-index}"
+DT = "https://datatracker.ietf.org"
+UA = "rfc-cli/1.0 (python urllib)"
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if TTY else s
+bold = lambda s: c("1", s)
+dim = lambda s: c("2", s)
+cyan = lambda s: c("36", s)
+yellow = lambda s: c("33", s)
+red = lambda s: c("31", s)
+green = lambda s: c("32", s)
+
+
+def die(msg):
+    print(red("rfc: ") + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        die(f"{url}: HTTP {e.code}")
+    except urllib.error.URLError as e:
+        die(f"{url}: {e.reason} (offline? cached docs still work)")
+
+
+def fetch_json(path):
+    data = fetch(DT + path)
+    return json.loads(data) if data else None
+
+
+# ---------- RFC index ----------
+
+def index(force=False):
+    os.makedirs(CACHE, exist_ok=True)
+    stale = not os.path.exists(INDEX_PATH) or time.time() - os.path.getmtime(INDEX_PATH) > INDEX_MAX_AGE
+    if force or stale:
+        if not force:
+            print(dim("updating RFC index..."), file=sys.stderr)
+        data = fetch(INDEX_URL)
+        if data:
+            with open(INDEX_PATH + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(INDEX_PATH + ".tmp", INDEX_PATH)
+        elif not os.path.exists(INDEX_PATH):
+            die("could not download the RFC index")
+    entries = {}
+    for e in ET.parse(INDEX_PATH).getroot().iter(NS + "rfc-entry"):
+        t = lambda tag: (e.findtext(NS + tag) or "").strip()
+        ids = lambda tag: [d.text for d in e.findall(f"{NS}{tag}/{NS}doc-id")]
+        num = int(t("doc-id")[3:])
+        entries[num] = {
+            "num": num,
+            "title": " ".join(t("title").split()),
+            "authors": [a.findtext(NS + "name") for a in e.findall(NS + "author")],
+            "date": f"{e.findtext(f'{NS}date/{NS}month') or ''} {e.findtext(f'{NS}date/{NS}year') or ''}".strip(),
+            "status": t("current-status"),
+            "stream": t("stream"),
+            "wg": t("wg_acronym"),
+            "keywords": [k.text or "" for k in e.findall(f"{NS}keywords/{NS}kw")],
+            "abstract": " ".join(" ".join((p.text or "").split()) for p in e.findall(f"{NS}abstract/{NS}p")),
+            "obsoletes": ids("obsoletes"),
+            "obsoleted_by": ids("obsoleted-by"),
+            "updates": ids("updates"),
+            "updated_by": ids("updated-by"),
+            "is_also": ids("is-also"),
+            "draft": t("draft"),
+        }
+    return entries
+
+
+def status_color(s):
+    s = s.upper()
+    if "STANDARD" in s:
+        return green(s)
+    if s in ("HISTORIC", "UNKNOWN"):
+        return dim(s)
+    return yellow(s)
+
+
+def one_line(e):
+    flag = red(" [obsoleted by " + ",".join(e["obsoleted_by"]) + "]") if e["obsoleted_by"] else ""
+    return f"{cyan(f'RFC {e['num']:>5}')}  {e['title']}  {dim(e['date'])} {status_color(e['status'])}{flag}"
+
+
+# ---------- reading ----------
+
+def page(path, title, search=None):
+    pager = os.environ.get("RFC_PAGER") or os.environ.get("PAGER") or "less"
+    if not sys.stdout.isatty():
+        with open(path, encoding="utf-8", errors="replace") as f:
+            shutil.copyfileobj(f, sys.stdout)
+        return
+    cmd = pager.split()
+    if os.path.basename(cmd[0]) == "less":
+        prompt = title.replace("?", "\\?").replace(":", "\\:").replace(".", "\\.")
+        cmd += ["-R", "-i", f"-P{prompt} ?pb(%pb\\%) :--", "--use-color"]
+        if search:
+            cmd.append("+/" + search)
+    subprocess.call(cmd + [path])
+
+
+def clean_txt(raw):
+    # Old RFCs are paginated with form feeds; strip them so less displays nicely.
+    return raw.removeprefix(b"\xef\xbb\xbf").replace(b"\x0c", b"")
+
+
+def get_rfc(num):
+    path = os.path.join(CACHE, f"rfc{num}.txt")
+    if not os.path.exists(path):
+        data = fetch(f"https://www.rfc-editor.org/rfc/rfc{num}.txt")
+        if data is None:
+            die(f"RFC {num} not found (not yet published, or never issued)")
+        os.makedirs(CACHE, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(clean_txt(data))
+    return path
+
+
+def resolve_draft(name):
+    """Return (name, rev) for a draft name, with or without a revision suffix."""
+    name = name.removesuffix(".txt")
+    m = re.fullmatch(r"(draft-.+)-(\d\d)", name)
+    if m:
+        return m.group(1), m.group(2)
+    doc = fetch_json(f"/api/v1/doc/document/{name}/?format=json")
+    if not doc:
+        die(f"{name}: no such draft on datatracker")
+    return name, doc["rev"]
+
+
+def get_draft(name):
+    if not name.startswith("draft-"):
+        # shorthand: "quic-multipath" -> draft-ietf-quic-multipath, else draft-quic-multipath
+        bare = re.sub(r"-\d\d$", "", name)
+        wg_doc = fetch_json(f"/api/v1/doc/document/draft-ietf-{bare}/?format=json")
+        name = ("draft-ietf-" if wg_doc else "draft-") + name
+    name, rev = resolve_draft(name)
+    path = os.path.join(CACHE, f"{name}-{rev}.txt")
+    if not os.path.exists(path):
+        data = fetch(f"https://www.ietf.org/archive/id/{name}-{rev}.txt")
+        if data is None:
+            die(f"{name}-{rev}: no text rendering in the I-D archive")
+        os.makedirs(CACHE, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(clean_txt(data))
+    return path, f"{name}-{rev}"
+
+
+# ---------- commands ----------
+
+def cmd_read(args):
+    search = None
+    if "-s" in args:
+        i = args.index("-s")
+        search = " ".join(args[i + 1:])
+        args = args[:i]
+    num = int(args[0].lower().removeprefix("rfc"))
+    path = get_rfc(num)
+    entries = index() if os.path.exists(INDEX_PATH) else {}
+    e = entries.get(num)
+    title = f"RFC {num}" + (f" - {e['title']}" if e else "")
+    if e and e["obsoleted_by"] and sys.stderr.isatty():
+        print(yellow(f"note: RFC {num} is obsoleted by {', '.join(e['obsoleted_by'])}"), file=sys.stderr)
+        time.sleep(1.2)
+    page(path, title, search)
+
+
+def cmd_info(args):
+    entries = index()
+    for a in args:
+        num = int(a.lower().removeprefix("rfc"))
+        e = entries.get(num)
+        if not e:
+            print(red(f"RFC {num}: not in index"))
+            continue
+        print(bold(f"RFC {num}: {e['title']}"))
+        print(f"  {dim('status')}   {status_color(e['status'])}   {dim('stream')} {e['stream']}"
+              + (f"   {dim('wg')} {e['wg']}" if e["wg"] and e["wg"] != "NON WORKING GROUP" else ""))
+        print(f"  {dim('date')}     {e['date']}")
+        print(f"  {dim('authors')}  {', '.join(e['authors'])}")
+        if e["draft"]:
+            print(f"  {dim('draft')}    {e['draft']}")
+        for key, label in (("obsoletes", "obsoletes"), ("obsoleted_by", "obsoleted by"),
+                           ("updates", "updates"), ("updated_by", "updated by"), ("is_also", "is also")):
+            if e[key]:
+                col = red if key == "obsoleted_by" else (lambda s: s)
+                print(f"  {dim(label + ':'):<12} {col(', '.join(e[key]))}")
+        if e["keywords"]:
+            print(f"  {dim('keywords')} {', '.join(e['keywords'])}")
+        if e["abstract"]:
+            width = min(shutil.get_terminal_size().columns, 100) - 2
+            print()
+            print(textwrap.fill(e["abstract"], width, initial_indent="  ", subsequent_indent="  "))
+        print(dim(f"  https://www.rfc-editor.org/rfc/rfc{num}.html"))
+        print()
+
+
+def cmd_search(args):
+    if not args:
+        die("usage: rfc search TERM...")
+    show_all = "-a" in args
+    terms = [t.lower() for t in args if t != "-a"]
+    hits = []
+    for e in index().values():
+        hay = " ".join([e["title"], " ".join(e["keywords"]), e["abstract"], e["wg"]]).lower()
+        if all(t in hay for t in terms):
+            # rank: title matches first, then newest
+            score = sum(t in e["title"].lower() for t in terms)
+            hits.append((score, e["num"], e))
+    hits.sort(key=lambda h: (-h[0], -h[1]))
+    hidden = 0
+    for _, _, e in hits:
+        if e["obsoleted_by"] and not show_all:
+            hidden += 1
+            continue
+        print(one_line(e))
+    if not hits:
+        print(dim("no matches"))
+    elif hidden:
+        print(dim(f"({hidden} obsoleted RFCs hidden; use -a to show)"))
+
+
+def cmd_draft(args):
+    if not args:
+        die("usage: rfc draft NAME[-REV] [-s PATTERN]")
+    search = None
+    if "-s" in args:
+        i = args.index("-s")
+        search = " ".join(args[i + 1:])
+        args = args[:i]
+    path, label = get_draft(args[0])
+    page(path, label, search)
+
+
+def cmd_wg(args):
+    if not args:
+        die("usage: rfc wg ACRONYM")
+    wg = args[0].lower()
+    data = fetch_json(f"/api/v1/doc/document/?group__acronym={wg}&type=draft&states__slug=active"
+                      "&format=json&limit=200")
+    if data is None:
+        die(f"working group {wg!r} not found")
+    print(bold(f"Active drafts in {wg}") + dim(f"  ({DT}/wg/{wg}/documents/)"))
+    if not data["objects"]:
+        print(dim("  none"))
+    for o in sorted(data["objects"], key=lambda o: o["time"], reverse=True):
+        print(f"  {cyan(o['name'] + '-' + o['rev'])}  {o['title']}  {dim(o['time'][:10])}")
+    rfcs = [e for e in index().values() if e["wg"].lower() == wg]
+    if rfcs:
+        print()
+        print(bold(f"RFCs from {wg}"))
+        for e in sorted(rfcs, key=lambda e: -e["num"]):
+            print("  " + one_line(e))
+
+
+def cmd_get(args):
+    for a in args:
+        if a.startswith("draft-"):
+            print(dim("cached ") + get_draft(a)[1])
+        else:
+            num = int(a.lower().removeprefix("rfc"))
+            get_rfc(num)
+            print(dim("cached ") + f"RFC {num}")
+
+
+def cmd_ls(args):
+    if not os.path.isdir(CACHE):
+        return
+    entries = index() if os.path.exists(INDEX_PATH) else {}
+    for f in sorted(os.listdir(CACHE)):
+        m = re.fullmatch(r"rfc(\d+)\.txt", f)
+        if m and int(m.group(1)) in entries:
+            print(one_line(entries[int(m.group(1))]))
+        elif m:
+            print(cyan(f"RFC {m.group(1)}"))
+        elif f.startswith("draft-"):
+            print(cyan(f.removesuffix(".txt")))
+
+
+def cmd_sync(args):
+    n = len(index(force=True))
+    print(f"RFC index updated: {n} RFCs")
+
+
+# ---------- IETF meeting agenda ----------
+
+STAR_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "rfc", "starred")
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def cached_fetch(name, url, max_age):
+    """Fetch url into the cache, reusing a copy younger than max_age; falls back to stale copies offline."""
+    path = os.path.join(CACHE, name)
+    fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < max_age
+    if not fresh:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            os.makedirs(CACHE, exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if not os.path.exists(path):
+                die(f"{url}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            if not os.path.exists(path):
+                die(f"{url}: {e.reason}")
+            print(dim("offline: using cached copy"), file=sys.stderr)
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def meeting_info(number=None):
+    """Metadata for IETF meeting `number`, or the current/most recent one."""
+    q = f"number={number}" if number else "order_by=-date&limit=6"
+    data = json.loads(cached_fetch(f"meetings-{number or 'latest'}.json",
+                                   f"{DT}/api/v1/meeting/meeting/?type=ietf&format=json&{q}", 12 * 3600))
+    today = time.strftime("%Y-%m-%d")
+    for m in data["objects"]:
+        if number or m["date"] <= today:
+            return m
+    die(f"IETF {number} not found")
+
+
+def load_agenda(m):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    num = m["number"]
+    data = cached_fetch(f"agenda-{num}.json", f"{DT}/meeting/{num}/agenda.json", 3600)
+    if data is None:
+        die(f"no agenda published yet for IETF {num}")
+    tz = ZoneInfo(m["time_zone"])
+    sessions = []
+    for s in json.loads(data)[num]:
+        if s["objtype"] != "session" or not s.get("start"):
+            continue
+        h, mi, se = (int(x) for x in s["duration"].split(":"))
+        start = datetime.fromisoformat(s["start"].replace("Z", "+00:00")).astimezone(tz)
+        s["_start"], s["_end"] = start, start + timedelta(hours=h, minutes=mi, seconds=se)
+        sessions.append(s)
+    sessions.sort(key=lambda s: (s["_start"], s["group"]["acronym"]))
+    return sessions, tz
+
+
+def starred():
+    try:
+        with open(STAR_PATH) as f:
+            return {l.strip().lower() for l in f if l.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def save_starred(stars):
+    os.makedirs(os.path.dirname(STAR_PATH), exist_ok=True)
+    with open(STAR_PATH, "w") as f:
+        f.write("".join(s + "\n" for s in sorted(stars)))
+
+
+def session_line(s, now, stars):
+    g = s["group"]
+    acr = g["acronym"]
+    t = f"{s['_start']:%H:%M}-{s['_end']:%H:%M}"
+    name = s["name"] if len(s["name"]) <= 44 else s["name"][:43] + "…"
+    tags = (yellow(" BOF") if s.get("is_bof") else "") + (red(" CANCELED") if s.get("status") == "canceled" else "")
+    star = yellow("★") if acr in stars else " "
+    line = f"{star} {t}  {cyan(f'{acr:<12}')} {name:<45} {dim(s.get('location') or '')}{tags}"
+    if s["_end"] < now:
+        return dim(re.sub(r"\033\[[0-9;]*m", "", line))
+    if s["_start"] <= now:
+        return green("▶") + line[1:]
+    return line
+
+
+class _HTMLText:
+    """Minimal HTML -> terminal text for WG agenda pages."""
+    def __new__(cls, html):
+        from html.parser import HTMLParser
+
+        class P(HTMLParser):
+            def __init__(self):
+                super().__init__(convert_charrefs=True)
+                self.out, self.depth, self.skip, self.head = [], 0, 0, None
+
+            def nl(self, n=1):
+                text = "".join(self.out)
+                self.out = [text.rstrip(" ") + "\n" * max(0, n - (len(text) - len(text.rstrip("\n"))))]
+
+            def handle_starttag(self, tag, attrs):
+                if tag in ("head", "script", "style", "title"):
+                    self.skip += 1
+                elif tag in ("h1", "h2", "h3", "h4"):
+                    self.nl(2)
+                    self.head = tag
+                    self.out.append("\033[1;36m" if TTY and tag in ("h1", "h2") else "\033[1m" if TTY else "")
+                    if tag in ("h3", "h4"):
+                        self.out.append("## " if tag == "h3" else "### ")
+                elif tag in ("ul", "ol"):
+                    self.depth += 1
+                    self.nl()
+                elif tag == "li":
+                    self.nl()
+                    self.out.append("  " * self.depth + "• ")
+                elif tag in ("p", "div", "tr", "pre"):
+                    self.nl(1 if self.depth else 2)
+                elif tag == "br":
+                    self.nl()
+                    self.out.append("  " * self.depth + "  ")
+
+            def handle_endtag(self, tag):
+                if tag in ("head", "script", "style", "title"):
+                    self.skip -= 1
+                elif tag in ("h1", "h2", "h3", "h4"):
+                    if TTY:
+                        self.out.append("\033[0m")
+                    self.nl()
+                elif tag in ("ul", "ol"):
+                    self.depth -= 1
+                    self.nl()
+
+            def handle_data(self, data):
+                if not self.skip:
+                    self.out.append(re.sub(r"\s+", " ", data))
+
+        p = P()
+        p.feed(html)
+        text = re.sub(r"\n{3,}", "\n\n", "".join(p.out))
+        return "\n".join(l.rstrip() for l in text.strip().splitlines()) + "\n"
+
+
+def drafts_in(text):
+    names = re.findall(r"draft-[a-z0-9][a-z0-9-]*[a-z0-9]", text.lower())
+    seen = []
+    for n in names:
+        n = re.sub(r"-\d\d$", "", n)
+        if n not in seen:
+            seen.append(n)
+    return seen
+
+
+def show_group(m, sessions, acr, now, stars):
+    mine = [s for s in sessions if s["group"]["acronym"] == acr]
+    num = m["number"]
+    out = [bold(f"IETF {num} · {acr}") + (yellow("  ★ starred") if acr in stars else "")]
+    if not mine:
+        out.append(dim(f"  {acr} has no sessions at IETF {num}"))
+    for s in mine:
+        out.append(f"  {s['_start']:%a %b %d}  " + session_line(s, now, stars).lstrip())
+    out.append(dim(f"  remote: https://meetings.conf.meetecho.com/ietf{num}/?group={acr}"))
+    out.append(dim(f"  notes:  https://notes.ietf.org/notes-ietf-{num}-{acr}"))
+    agenda_url = next((s["agenda"] for s in mine if s.get("agenda")), None)
+    drafts = []
+    if agenda_url:
+        raw = cached_fetch(f"agenda-{num}-{acr}.html", agenda_url, 1800)
+        html = (raw or b"").decode("utf-8", errors="replace")
+        drafts = drafts_in(html)
+        is_html = re.match(r"\s*<(!doctype|html)", html, re.I)
+        out += ["", _HTMLText(html) if is_html else html.rstrip() + "\n"]
+    elif mine:
+        out += ["", dim("  (no agenda posted yet)")]
+    slides = [p for s in mine for p in s.get("presentations", [])]
+    if slides:
+        out += ["", bold("Slides")]
+        for p in slides:
+            out.append(f"  • {p['title']}  {dim(f'https://datatracker.ietf.org/doc/{p['name']}/')}")
+    if drafts:
+        out += ["", bold("Drafts on the agenda") + dim("  (read with: rfc draft NAME)")]
+        out += [f"  {cyan(d)}" for d in drafts]
+    text = "\n".join(out) + "\n"
+    path = os.path.join(CACHE, f"agenda-{num}-{acr}.txt")
+    with open(path, "w") as f:
+        f.write(text)
+    if sys.stdout.isatty() and len(text.splitlines()) > shutil.get_terminal_size().lines - 2:
+        page(path, f"IETF {num} {acr} agenda")
+    else:
+        sys.stdout.write(text)
+
+
+def cmd_ietf(args):
+    from datetime import datetime, timedelta
+    number = next((a for a in args if re.fullmatch(r"\d{2,3}", a)), None)
+    args = [a.lower() for a in args if a != number]
+    stars = starred()
+
+    if args and args[0] in ("star", "unstar"):
+        acrs = set(args[1:])
+        if not acrs:
+            die(f"usage: rfc ietf {args[0]} ACRONYM...")
+        stars = stars | acrs if args[0] == "star" else stars - acrs
+        save_starred(stars)
+        print("starred: " + (", ".join(sorted(stars)) or dim("(none)")))
+        return
+
+    m = meeting_info(number)
+    sessions, tz = load_agenda(m)
+    now = datetime.now(tz)
+    acronyms = {s["group"]["acronym"] for s in sessions}
+    areas = {s["group"].get("parent") for s in sessions}
+    what = args[0] if args else None
+
+    if what in acronyms and what not in areas:
+        return show_group(m, sessions, what, now, stars)
+
+    title = f"IETF {m['number']} · {m['city']} · from {m['date']} · times in {m['time_zone']}"
+    if what is None:
+        pick = sessions
+    elif what in ("today", "tomorrow"):
+        day = (now + timedelta(days=what == "tomorrow")).date()
+        pick = [s for s in sessions if s["_start"].date() == day]
+    elif what in ("now", "next"):
+        pick = [s for s in sessions if s["_end"] > now and s["_start"] < now + timedelta(minutes=90)]
+    elif what[:3] in DAYS:
+        pick = [s for s in sessions if s["_start"].weekday() == DAYS.index(what[:3])]
+    elif what in ("mine", "starred"):
+        if not stars:
+            die("nothing starred yet: rfc ietf star quic tls ...")
+        pick = [s for s in sessions if s["group"]["acronym"] in stars]
+    elif what in areas:
+        pick = [s for s in sessions if s["group"].get("parent") == what]
+        title += f" · area {what}"
+    else:
+        # substring search over acronym and name
+        pick = [s for s in sessions if what in s["group"]["acronym"] or what in s["name"].lower()]
+        if not pick:
+            die(f"nothing matches {what!r} at IETF {m['number']}")
+
+    out = [bold(title)]
+    day = None
+    for s in pick:
+        if s["_start"].date() != day:
+            day = s["_start"].date()
+            out += ["", bold(f"{s['_start']:%A, %B %d}".upper())]
+        out.append(session_line(s, now, stars))
+    if not pick:
+        out.append(dim("  no sessions"))
+    sys.stdout.write("\n".join(out) + "\n")
+
+
+COMMANDS = {"info": cmd_info, "search": cmd_search, "s": cmd_search, "draft": cmd_draft, "d": cmd_draft,
+            "wg": cmd_wg, "ietf": cmd_ietf, "get": cmd_get, "ls": cmd_ls, "sync": cmd_sync}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd = args[0]
+    if cmd in COMMANDS:
+        COMMANDS[cmd](args[1:])
+    elif re.fullmatch(r"(?i)(rfc)?\d+", cmd):
+        cmd_read(args)
+    elif cmd.startswith("draft-"):
+        cmd_draft(args)
+    else:
+        # bare words: treat as a search
+        cmd_search(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
